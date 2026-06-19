@@ -3,7 +3,7 @@ File contém: definição do Protocolo;
 */
 
 /*
-Bibliotecas utilizadas: nom
+Bibliotecas utilizadas: nom (parsing binário)
 */
 use nom::{
   IResult,
@@ -14,7 +14,7 @@ use nom::{
 };
 
 /* 
-funções p/decodificar e codificar mensagens
+Funções p/decodificar e codificar mensagens
 binárias;
 -> 'encode': objeto retorna a si mesmo em BIN
 -> 'decode': objeto recebe um BIN (de seu tipo)
@@ -28,10 +28,11 @@ pub trait EncodeDecode {
 }
 
 /* 
-struct que representa o Header; é especificado como
+Struct que representa o Header; é especificado como
 decodificar e codificá-la;
 */
 
+// enum que define qual o tipo do payload
 pub enum TipoMensagem {
     CONNECT,
     SENSOR_DATA,
@@ -52,7 +53,15 @@ pub struct Header {
 
 impl EncodeDecode for Header {
     fn encode(&self) -> Vec<u8> {
+        /* a variável 'value' será gradativamente preenchida pelos 
+        campos '[ magic | version | ack | reserved | tipo | tamanho ]',
+         e aí será transformada em binário ao final da função; */
         let mut value: u64 = 0;
+
+        /* abaixo, os '<<' permitem posicionar os segmentos binários em 
+        suas respectivas posições no header; a máscara '0b111' é usada 
+        para pegar os 4 bits menos significativos de um número (ex: a 
+        variável 'tipo' tem tamanho de 4 bits, mas é armazenada com 64); */
 
         // 32 bits -> magic number
         value |= (self.magic_number as u64) << 32;
@@ -76,12 +85,14 @@ impl EncodeDecode for Header {
         // 16 bits -> tamanho
         value |= self.tamanho as u64;
 
-        // bytes ficam big-endian
+        // bytes ficam big-endian (network byte order)
         value.to_be_bytes().to_vec()
     }
 
     fn decode(input: &[u8]) -> IResult<&[u8], Self> {
         bits(|input| {
+            /* abaixo, gradativamente são lidos os bits presentes no binário
+            da mensagem, e assinalados aos campos correspondentes; */
             let (input, magic): (_, u32) = take(32usize)(input)?;
             let (input, versao): (_, u8) = take(8usize)(input)?;
             let (input, ack_bit): (_, u8) = take(1usize)(input)?;
@@ -89,8 +100,10 @@ impl EncodeDecode for Header {
             let (input, tipo_raw): (_, u8) = take(4usize)(input)?;
             let (input, tamanho): (_, u16) = take(16usize)(input)?;
 
+            // transformando o bit 'ack_bit' em um bool (basicamente casting);
             let ack = ack_bit != 0;
              
+            // determinando o tipo da mensagem;
             let tipo = match tipo_raw {
                 0 => TipoMensagem::CONNECT,
                 1 => TipoMensagem::SENSOR_DATA,
@@ -98,20 +111,20 @@ impl EncodeDecode for Header {
                 3 => TipoMensagem::SENSOR_QUERY,
                 4 => TipoMensagem::SENSOR_RES,
                 5 => TipoMensagem::CONFIG,
-                // rejeita mensagens que não sejam definidas no nosso escopo
+                // rejeita mensagens que não sejam definidas no nosso escopo;
                 _ => return Err(nom::Err::Failure(
                     nom::error::Error::new(input, nom::error::ErrorKind::Switch)
                 )),
             };
 
-            // rejeita protocolos que não sejam o nosso no trabalho 
+            // rejeita protocolos que não sejam o nosso no trabalho ;
             if magic != u32::from_be_bytes(*b"PPPP") {
                 return Err(nom::Err::Failure(
                     nom::error::Error::new(input, nom::error::ErrorKind::Tag)
                 ));
             }
 
-            /* preenche nossa Struct 'Header' */
+            // preenche nossa Struct 'Header';
             let header = Header {
                 magic_number: magic,
                 versao,
@@ -127,9 +140,15 @@ impl EncodeDecode for Header {
 }
 
 /*
-structs que definem cada tipo de mensagem especificada
+Structs que definem cada tipo de mensagem especificada
 no relatório (CONNECT, ACT_CMD, etc); para cada struct,
-é especificado como decoficar e codificar ela;
+é especificado como decoficar e codificar ela; 
+
+As formas de fazê-lo são todas semelhantes para as structs:
+-> decode: lê-se 'X' bits, armazenando-os em uma variável de
+   tamanho >= 'X' bits, cujo nome é o significado dos bits;
+-> encode: cria-se um vetor 'v', e é adicionado a ele byte a 
+   byte as informações necessários a serem codificadas;
 */
 
 /* -> CONNECT <- */
@@ -284,10 +303,15 @@ pub struct Mensagem {
     pub payload: Option<Payload>, 
 }
 
+// Encode: Mensagem --> BIN (tipo = Vec<u8>);
+// Decode: BIN --> Mensagem (tipo = Mensagem);
 impl EncodeDecode for Mensagem {
     fn encode(&self) -> Vec<u8> {
         let mut payload_bytes = Vec::new();
 
+        /* Determina se há Payload ou não, e, caso sim,
+        requisita codifica aquele tipo específico de 
+        Payload (CONNECT, CONFIG, etc); */
         if let Some(payload) = &self.payload {
             payload_bytes = match payload {
                 Payload::Connect(p) => p.encode(),
@@ -299,15 +323,17 @@ impl EncodeDecode for Mensagem {
             };
         }
 
+        // encoda o header;
         let mut header = self.header.encode();
         header.extend(payload_bytes);
         header
     }
 
     fn decode(input: &[u8]) -> IResult<&[u8], Self> {
+        // decodificando o header
         let (input, header) = Header::decode(input)?;
 
-        // ACK: sem payload
+        // se for um ACk, esqueça o payload
         if header.ack {
             return Ok((input, Mensagem {
                 header,
@@ -315,6 +341,8 @@ impl EncodeDecode for Mensagem {
             }));
         }
 
+        // identificando o tipo de Payload, e decodificando-o
+        // especificamente 
         let (input, payload) = match header.tipo {
             TipoMensagem::CONNECT => {
                 let (i, p) = Connect::decode(input)?;
@@ -342,6 +370,8 @@ impl EncodeDecode for Mensagem {
             }
         };
 
+        // retornando a struct Mensagem, com Header e
+        // (se houver) o payload
         Ok((input, Mensagem {
             header,
             payload: Some(payload)
