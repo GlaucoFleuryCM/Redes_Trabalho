@@ -33,6 +33,7 @@ decodificar e codificá-la;
 */
 
 // enum que define qual o tipo do payload
+#[derive(PartialEq, Eq)]
 pub enum TipoMensagem {
     CONNECT,
     SENSOR_DATA,
@@ -334,7 +335,7 @@ impl EncodeDecode for Mensagem {
         let (input, header) = Header::decode(input)?;
 
         // se for um ACk, esqueça o payload
-        if header.ack {
+        if (header.ack) {
             return Ok((input, Mensagem {
                 header,
                 payload: None
@@ -376,5 +377,27 @@ impl EncodeDecode for Mensagem {
             header,
             payload: Some(payload)
         }))
+    }
+}
+
+/* a função 'try_decode' é um wrapper sobre a função 'decode';
+ela existe para considerar a possibilidade de leitura de mensagens
+ainda incompletas pelo servidor */
+impl Mensagem {
+    pub fn try_decode(input: &[u8]) -> Option<(Mensagem, usize)> {
+        match Mensagem::decode(input) {
+            Ok((rest, msg)) => {
+                let consumed = input.len() - rest.len();
+                Some((msg, consumed))
+            }
+            Err(nom::Err::Incomplete(_)) => {
+                // não tem dados suficientes ainda; aguardar e ler denovo
+                None
+            }
+            Err(_) => {
+                // não sei o que fazer aqui
+                None
+            }
+        }
     }
 }
