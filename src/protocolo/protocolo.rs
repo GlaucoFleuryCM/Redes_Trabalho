@@ -7,10 +7,7 @@ Bibliotecas utilizadas: nom (parsing binário)
 */
 use nom::{
   IResult,
-  Parser,
-  bits::{bits, complete::take},
-  bytes::complete::{tag, take_while_m_n},
-  combinator::map_res
+  bits::{bits, complete::take}
 };
 
 /* 
@@ -33,7 +30,7 @@ decodificar e codificá-la;
 */
 
 // enum que define qual o tipo do payload
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Copy, Clone)]
 pub enum TipoMensagem {
     CONNECT,
     SENSOR_DATA,
@@ -180,17 +177,17 @@ pub struct SensorData {
 impl EncodeDecode for SensorData {
     fn encode(&self) -> Vec<u8> {
         let mut v = Vec::new();
-        v.push(self.sensor_id as u8);
+        v.extend(self.sensor_id.to_be_bytes());
         v.extend(self.value.to_be_bytes());
         v
     }
 
     fn decode(input: &[u8]) -> IResult<&[u8], Self> {
-        let (input, sensor_id) = nom::number::complete::be_u8(input)?;
+        let (input, sensor_id) = nom::number::complete::be_u32(input)?;
         let (input, value_bytes) = nom::bytes::complete::take(4usize)(input)?;
         let value = f32::from_be_bytes(value_bytes.try_into().unwrap());
         Ok((input, SensorData {
-            sensor_id: sensor_id as u32,
+            sensor_id,
             value
         }))
     }
@@ -198,7 +195,6 @@ impl EncodeDecode for SensorData {
 
 /* -> ACT_CMD <- */
 pub struct ActCmd {
-    pub actuator_id: u32,
     pub command: u8,
 }
 
@@ -209,10 +205,7 @@ impl EncodeDecode for ActCmd {
 
     fn decode(input: &[u8]) -> IResult<&[u8], Self> {
         let (input, command) = nom::number::complete::be_u8(input)?;
-        Ok((input, ActCmd {
-            actuator_id: 0, // não existe no protocolo
-            command
-        }))
+        Ok((input, ActCmd { command }))
     }
 }
 
@@ -223,13 +216,13 @@ pub struct SensorQuery {
 
 impl EncodeDecode for SensorQuery {
     fn encode(&self) -> Vec<u8> {
-        vec![self.sensor_id as u8]
+        self.sensor_id.to_be_bytes().to_vec()
     }
 
     fn decode(input: &[u8]) -> IResult<&[u8], Self> {
-        let (input, sensor_id) = nom::number::complete::be_u8(input)?;
+        let (input, sensor_id) = nom::number::complete::be_u32(input)?;
         Ok((input, SensorQuery {
-            sensor_id: sensor_id as u32
+            sensor_id
         }))
     }
 }
@@ -243,17 +236,17 @@ pub struct SensorRes {
 impl EncodeDecode for SensorRes {
     fn encode(&self) -> Vec<u8> {
         let mut v = Vec::new();
-        v.push(self.sensor_id as u8);
+        v.extend(self.sensor_id.to_be_bytes());
         v.extend(self.value.to_be_bytes());
         v
     }
 
     fn decode(input: &[u8]) -> IResult<&[u8], Self> {
-        let (input, sensor_id) = nom::number::complete::be_u8(input)?;
+        let (input, sensor_id) = nom::number::complete::be_u32(input)?;
         let (input, value_bytes) = nom::bytes::complete::take(4usize)(input)?;
         let value = f32::from_be_bytes(value_bytes.try_into().unwrap());
         Ok((input, SensorRes {
-            sensor_id: sensor_id as u32,
+            sensor_id,
             value
         }))
     }
@@ -269,17 +262,17 @@ impl EncodeDecode for Config {
     fn encode(&self) -> Vec<u8> {
         let mut v = Vec::new();
         v.push(self.key);
-        v.extend((self.value as f32).to_be_bytes());
+        v.extend(self.value.to_be_bytes());
         v
     }
 
     fn decode(input: &[u8]) -> IResult<&[u8], Self> {
         let (input, key) = nom::number::complete::be_u8(input)?;
         let (input, value_bytes) = nom::bytes::complete::take(4usize)(input)?;
-        let value = f32::from_be_bytes(value_bytes.try_into().unwrap());
+        let value = f32::from_be_bytes(value_bytes.try_into().unwrap()); // value is f32
         Ok((input, Config {
             key,
-            value: value as f32
+            value
         }))
     }
 }
@@ -335,7 +328,7 @@ impl EncodeDecode for Mensagem {
         let (input, header) = Header::decode(input)?;
 
         // se for um ACk, esqueça o payload
-        if (header.ack) {
+        if header.ack {
             return Ok((input, Mensagem {
                 header,
                 payload: None
@@ -394,9 +387,14 @@ impl Mensagem {
                 // não tem dados suficientes ainda; aguardar e ler denovo
                 None
             }
-            Err(_) => {
-                // não sei o que fazer aqui
+            Err(nom::Err::Error(_)) => {
+                // Erro recuperável, pode ser que mais dados resolvam.
                 None
+            }
+            Err(nom::Err::Failure(e)) => {
+                // Erro irrecuperável. Isso é um problema sério no protocolo.
+                // Panicar é a melhor opção para tornar o erro visível.
+                panic!("Erro irrecuperável ao decodificar mensagem: {:?}", e);
             }
         }
     }
