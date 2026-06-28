@@ -1,163 +1,146 @@
 use clap::Parser;
+use std::process::{Child, Command};
+use std::sync::{Mutex, OnceLock};
 
-mod protocolo;
-mod componentes;
+mod protocol;
+mod components;
 
-use componentes::{
-    atuador::{Atuador, AtuadorTipo},
-    cliente::Cliente,
-    gerenciador::Gerenciador,
+use components::{
+    actuator::Actuator,
+    client::Client,
+    manager::Manager,
     sensor::Sensor,
+    devices,
     env_io,
 };
 
-const TEMP_FILE: &str = "src/env_vars/temp.txt";
-const HUM_FILE: &str = "src/env_vars/hum.txt";
-const CO2_FILE: &str = "src/env_vars/co2.txt";
+// lista global dos processos filhos do modo completo, pro handler de ctrl+c poder matá-los
+static CHILDREN: OnceLock<Mutex<Vec<Child>>> = OnceLock::new();
+fn children() -> &'static Mutex<Vec<Child>> {
+    CHILDREN.get_or_init(|| Mutex::new(Vec::new()))
+}
 
 #[derive(Parser)]
 #[command(name = "estufa")]
-#[command(about = "Simulador de estufa", long_about = None)]
 struct Cli {
     #[command(subcommand)]
-    componente: Componentes,
+    component: Component,
 }
 
 #[derive(Parser, Clone)]
-enum Componentes {
-    /// Roda o gerenciador
-    Gerenciador,
-    /// Roda um sensor
+enum Component {
+    #[command(name = "gerenciador")]
+    Manager,
+    #[command(name = "sensor")]
     Sensor {
-        /// ID do sensor
         #[arg(short, long)]
         id: u8,
     },
-    /// Roda um atuador
-    Atuador {
-        /// ID do atuador
+    #[command(name = "atuador")]
+    Actuator {
         #[arg(short, long)]
         id: u8,
     },
-    /// Roda o cliente
-    Cliente,
-    /// Roda a simulação completa
-    Completo,
+    #[command(name = "cliente")]
+    Client,
+    #[command(name = "completo")]
+    Complete,
 }
 
 
 fn main() {
     let cli = Cli::parse();
 
-    match cli.componente {
-        Componentes::Gerenciador => {
-            println!("=== Iniciando Gerenciador ===");
-            env_io::init_env_file(TEMP_FILE, 25.0);
-            env_io::init_env_file(HUM_FILE, 50.0);
-            env_io::init_env_file(CO2_FILE, 400.0);
-            let gerenciador = Gerenciador::new();
-            gerenciador.start_decay_thread();
-            gerenciador.run();
+    /* remover arquivos do ambiente quando interromper o progama com ctrl-c */
+    ctrlc::set_handler(|| {
+        println!("\nInterrompido, limpando os arquivos de ambiente...");
+        // mata os processos filhos (modo completo) pra ninguém recriar arquivo depois da limpeza
+        if let Some(lock) = CHILDREN.get() {
+            if let Ok(mut kids) = lock.lock() {
+                for child in kids.iter_mut() {
+                    let _ = child.kill();
+                }
+            }
+        }
+        env_io::SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        for s in devices::SENSORS {
+            env_io::remove_env_file(s.file);
+        }
+        std::process::exit(0);
+    }).expect("erro ao registrar handler de ctrl+c");
+
+    match cli.component {
+        Component::Manager => {
+            println!("Iniciando Gerenciador");
+            for s in devices::SENSORS {
+                env_io::init_env_file(s.file, s.initial_value);
+            }
+            let manager = Manager::new();
+            manager.start_decay_thread();
+            manager.run();
         },
-        Componentes::Sensor { id } => {
-            println!("=== Iniciando Sensor ID: {} ===", id);
+        Component::Sensor { id } => {
+            println!("Iniciando Sensor {}", id);
             let sensor = Sensor::new(id);
             sensor.start();
-            // Keep the main thread alive
+            // mantém a thread principal rodando
             std::thread::park();
         },
-        Componentes::Atuador { id } => {
-            println!("=== Iniciando Atuador ID: {} ===", id);
-            let tipo = match id {
-                3 => AtuadorTipo::Aquecedor,
-                4 => AtuadorTipo::Resfriador,
-                5 => AtuadorTipo::Irrigador,
-                6 => AtuadorTipo::InjetorCO2,
-                _ => {
-                    eprintln!("ID de atuador inválido: {}", id);
-                    return;
-                }
-            };
-            let atuador = Atuador::new(id, tipo);
-            atuador.start();
-            // Keep the main thread alive
+        Component::Actuator { id } => {
+            if devices::actuator_by_id(id).is_none() {
+                return;
+            }
+            let actuator = Actuator::new(id);
+            actuator.start();
+            // mantém a thread principal rodando
             std::thread::park();
         },
-        Componentes::Cliente => {
-            println!("=== Iniciando Cliente ===");
-            let cliente = Cliente::new();
-            cliente.run();
+        Component::Client => {
+            println!("Iniciando Cliente");
+            let client = Client::new();
+            client.run();
         },
-        Componentes::Completo => {
-            run_completo();
+        Component::Complete => {
+            run_complete();
         },
     }
 }
 
-fn run_completo(){
+fn run_complete() {
     use std::thread;
     use std::time::Duration;
-    println!("=== Iniciando Simulação da Estufa ===");
+    println!("Iniciando Simulação da Estufa (processos separados)");
 
-    // 1. Inicializa os arquivos de ambiente
-    println!("Inicializando arquivos de ambiente...");
-    env_io::init_env_file(TEMP_FILE, 25.0);
-    env_io::init_env_file(HUM_FILE, 50.0);
-    env_io::init_env_file(CO2_FILE, 400.0);
-    println!("Arquivos de ambiente prontos.");
+    // sobe cada componente como um processo separado, reinvocando esse mesmo binário
+    // com o subcomando dele; os filhos herdam o stdout/stderr, então os logs aparecem
+    // todos no mesmo terminal
+    let exe = std::env::current_exe().expect("não achou o próprio executável");
+    let spawn = |args: &[&str]| {
+        let child = Command::new(&exe).args(args).spawn().expect("falha ao subir processo filho");
+        children().lock().unwrap().push(child);
+    };
 
-    // 2. Cria os componentes
-    let gerenciador = Gerenciador::new();
-
-    // Sensores
-    let sensor_temp = Sensor::new(0); // ID 0 para Temperatura
-    let sensor_hum = Sensor::new(1);  // ID 1 para Umidade
-    let sensor_co2 = Sensor::new(2);  // ID 2 para CO2
-
-    // Atuadores
-    let atuador_aq = Atuador::new(3, AtuadorTipo::Aquecedor);      // ID 3
-    let atuador_res = Atuador::new(4, AtuadorTipo::Resfriador);     // ID 4
-    let atuador_irr = Atuador::new(5, AtuadorTipo::Irrigador);    // ID 5
-    let atuador_co2 = Atuador::new(6, AtuadorTipo::InjetorCO2);   // ID 6
-
-    let cliente = Cliente::new();
-
-    // 3. Inicia as threads dos componentes
-    println!("Iniciando componentes em threads separadas...");
-
-    // Thread do Gerenciador (decaimento do ambiente)
-    gerenciador.start_decay_thread();
-
-    // Inicia a thread principal do Gerenciador
-    let manager_handle = thread::spawn(move || {
-        gerenciador.run();
-    });
-
-    // Dá um tempo para o servidor do gerenciador subir antes de iniciar os clientes
+    // o gerenciador sobe primeiro, inicializa os arquivos de ambiente e abre a porta
+    spawn(&["gerenciador"]);
     thread::sleep(Duration::from_secs(2));
 
-    // Threads dos Sensores
-    sensor_temp.start();
-    sensor_hum.start();
-    sensor_co2.start();
+    // um processo por sensor e por atuador, tudo vindo do registro central
+    for s in devices::SENSORS {
+        let id = s.id.to_string();
+        spawn(&["sensor", "--id", &id]);
+    }
+    for a in devices::ACTUATORS {
+        let id = a.id.to_string();
+        spawn(&["atuador", "--id", &id]);
+    }
 
-    // Threads dos Atuadores
-    atuador_aq.start();
-    atuador_res.start();
-    atuador_irr.start();
-    atuador_co2.start();
-
-    // Dá um tempo para os dispositivos conectarem antes do cliente
+    // dá um tempo pros dispositivos conectarem antes do cliente
     thread::sleep(Duration::from_secs(1));
+    spawn(&["cliente"]);
 
-    // Thread do Cliente
-    let client_handle = thread::spawn(move || {
-        cliente.run();
-    });
-
-    // Mantém a thread principal viva esperando a conclusão das outras threads.
-    manager_handle.join().unwrap();
-    client_handle.join().unwrap();
-
-    println!("=== Simulação da Estufa Terminada ===");
+    // segura o processo pai vivo até o ctrl+c (os filhos rodam sozinhos)
+    loop {
+        thread::sleep(Duration::from_secs(3600));
+    }
 }
